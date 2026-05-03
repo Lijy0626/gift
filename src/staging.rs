@@ -1,6 +1,8 @@
 //! 工作区文件暂存（类似 `git add`）：写入 loose objects 并更新 index。
 
-use crate::add_commit::{self, IndexFile};
+use crate::index::{self, IndexFile};
+use crate::object::{self};
+
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// # 参数
 ///
 /// - **`git_dir`**：Git 目录（内含 `objects/`、`index`），可为 `.git`、`.gift` 等。
-/// - **`work_tree`**：工作区根目录；index 中的路径为其相对路径（经 [`add_commit::index_path_bytes`]）。
+/// - **`work_tree`**：工作区根目录；index 中的路径为其相对路径（经 [`index::index_path_bytes`]）。
 /// - **`inputs`**：用户给出的路径列表；相对路径相对于**进程当前工作目录**解析，再规范化为绝对路径并校验落在 `work_tree` 内。
 /// - **`recursive_dirs`**：为 `true` 时递归展开目录内的文件与符号链接；为 `false` 时若某条路径为目录则返回错误。
 ///
@@ -53,7 +55,7 @@ pub fn stage_paths(
     
     let index_path = git_dir.join("index");
     let mut index = if index_path.exists() {
-        add_commit::parse_index_file(&index_path).with_context(|| {
+        index::parse_index_file(&index_path).with_context(|| {
             format!("parse index {}", index_path.display())
         })?
     } else {
@@ -63,12 +65,12 @@ pub fn stage_paths(
     for leaf in &leaves {
         ensure_not_inside_git_dir(leaf, &git_dir_canon)?;
 
-        let (sha, blob_content) = add_commit::hash_object(leaf)?;
-        add_commit::write_hash_object(git_dir, &sha, &blob_content)?;
+        let (sha, blob_content) = object::hash_object(leaf)?;
+        object::write_hash_object(git_dir, &sha, &blob_content)?;
 
         let md = fs::symlink_metadata(leaf)?;
-        let path_bytes = add_commit::index_path_bytes(&work_tree_canon, leaf)?;
-        add_commit::add_index(
+        let path_bytes = index::index_path_bytes(&work_tree_canon, leaf)?;
+        index::add_index(
             &mut index,
             &md,
             path_bytes,
@@ -77,7 +79,7 @@ pub fn stage_paths(
         .with_context(|| format!("add_index {}", leaf.display()))?;
     }
 
-    add_commit::write_index_file(&index_path, &index).with_context(|| {
+    index::write_index_file(&index_path, &index).with_context(|| {
         format!("write_index_file {}", index_path.display())
     })?;
 

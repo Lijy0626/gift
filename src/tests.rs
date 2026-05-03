@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::add_commit;
+use crate::index;
 
 fn make_case_dir(case_name: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -66,12 +66,12 @@ fn cmp_write_obj() {
     super::init(&gift_dir).unwrap();
 
     let my_obj_path = case_dir.join("a.txt");
-    let (obj_hash, obj_content) = super::add_commit::hash_object(my_obj_path).unwrap();
-    super::add_commit::write_hash_object(&gift_dir, &obj_hash, &obj_content).unwrap();
+    let (obj_hash, obj_content) = super::object::hash_object(my_obj_path).unwrap();
+    super::object::write_hash_object(&gift_dir, &obj_hash, &obj_content).unwrap();
 
     let my_obj_path = case_dir.join("foo/bar");
-    let (obj_hash, obj_content) = super::add_commit::hash_object(my_obj_path).unwrap();
-    super::add_commit::write_hash_object(&gift_dir, &obj_hash, &obj_content).unwrap();
+    let (obj_hash, obj_content) = super::object::hash_object(my_obj_path).unwrap();
+    super::object::write_hash_object(&gift_dir, &obj_hash, &obj_content).unwrap();
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn parse_index() {
     run_git(&case_dir, &["add", "."]);
 
     // 3. 解析index_file
-    add_commit::display_index_file(&case_dir.join(".git/index")).unwrap();
+    index::display_index_file(&case_dir.join(".git/index")).unwrap();
 }
 
 /// `stage_paths` 写入 objects + index 后，用 `parse_index_file` 读回并校验路径、oid 及 loose object 文件存在。
@@ -109,10 +109,10 @@ fn stage_paths_roundtrip_index() {
         work_tree.join("top.txt"),
         work_tree.join("sub"),
     ];
-    super::stage::stage_paths(&git_dir, &work_tree, &inputs, true).unwrap();
+    super::staging::stage_paths(&git_dir, &work_tree, &inputs, true).unwrap();
 
     // 拿到并检验index_file
-    let idx = add_commit::parse_index_file(git_dir.join("index")).unwrap();
+    let idx = index::parse_index_file(git_dir.join("index")).unwrap();
     assert_eq!(idx.version(), 2, "index version");
     assert_eq!(idx.entries().len(), 2, "entry count");
 
@@ -127,7 +127,7 @@ fn stage_paths_roundtrip_index() {
     for e in idx.entries() {
         let rel = std::str::from_utf8(e.path()).expect("entry path utf-8");
         let disk = work_tree.join(rel);
-        let (sha, _) = add_commit::hash_object(&disk).unwrap();
+        let (sha, _) = super::object::hash_object(&disk).unwrap();
         assert_eq!(
             hex::encode(sha.as_bytes()),
             hex::encode(e.obj_name().as_bytes()),

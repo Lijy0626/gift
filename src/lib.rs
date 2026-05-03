@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-pub mod add_commit;
-pub mod stage;
+pub mod object;
+pub mod index;
+pub mod staging;
 
 #[cfg(test)]
 mod tests;
