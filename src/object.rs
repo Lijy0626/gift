@@ -29,7 +29,7 @@ pub enum FileMode {
     Directory,          // 40000(注意，长度与其他的不同)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectSha {
     SHA1([u8; 20]),
     SHA256([u8; 32]), // TODO: support SHA256

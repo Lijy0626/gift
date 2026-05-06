@@ -551,6 +551,14 @@ pub mod index_tree {
     }
 
     impl BlobLeaf {
+        pub fn file_mode(&self) -> FileMode {
+            self.file_mode
+        }
+
+        pub fn object_name(&self) -> &ObjectSha {
+            &self.object_name
+        }
+
         pub fn object_file_path(&self, git_dir: impl AsRef<Path>) -> PathBuf {
             let hash = String::from_utf8(self.object_name.as_bytes().to_vec()).unwrap();
             let object_dir_path = git_dir.as_ref().join("objects").join(&hash[0..2]);
@@ -571,15 +579,6 @@ pub mod index_tree {
 
     impl TreeNode {
         /// 自顶向下构造一条单链子树，末端为 blob。
-        pub fn build_from_parent(parent_dir_iter: &mut Components<'_>, blob: BlobLeaf) -> TreeNode {
-            let Some(child_name) =  parent_dir_iter.next().map(|x|x.as_os_str().to_owned()) else {
-                return TreeNode::Blob(blob)
-            };
-            let mut result: BTreeMap<OsString, TreeNode> = BTreeMap::new();
-            result.insert(child_name, Self::build_from_parent(parent_dir_iter, blob));
-            return TreeNode::Tree(result)
-        }
-
         /// 在本结点必须是 `Tree` 的前提下，沿父路径剩余分量把 `blob` 放进正确的子位置
         pub fn insert_blob(
             &mut self, 
@@ -620,6 +619,11 @@ pub mod index_tree {
     }
 
     impl IndexRootTree {
+        /// 根结点下第一层子项（用于测试或调试时遍历整棵树）。
+        pub fn root_children(&self) -> &BTreeMap<OsString, TreeNode> {
+            &self.children
+        }
+
         pub fn insert_blob(
             &mut self, parent_dir_iter: 
             &mut Components<'_>, 
@@ -654,12 +658,14 @@ pub mod index_tree {
             &self, 
             git_dir: impl AsRef<Path>, 
             is_sha1: bool) 
+        -> Result<ObjectSha>
         {
             let entries = write_children_return_entries(&self.children, git_dir.as_ref(), is_sha1);
             let content = TreeObject::entries_to_binary(entries, is_sha1);
-            let hash: [u8; 20] = Sha1::digest(&content).try_into().unwrap();
+            let hash: [u8; 20] = Sha1::digest(&content).try_into()?;
             let object_name = ObjectSha::SHA1(hash);
-            write_hash_object(git_dir.as_ref(), &object_name, &content).unwrap();
+            write_hash_object(git_dir.as_ref(), &object_name, &content)?;
+            Ok(object_name)
         }
     }
 
@@ -683,7 +689,9 @@ pub mod index_tree {
                 e.get_mut().insert_blob(parent_dir_iter, blob_file_name, blob)?;
             }
             btree_map::Entry::Vacant(e) => {
-                e.insert(TreeNode::build_from_parent(parent_dir_iter, blob));
+                let mut child_map = BTreeMap::new();
+                insert_blob_into_children_map(&mut child_map, parent_dir_iter, blob_file_name, blob)?;
+                e.insert(TreeNode::Tree(child_map));
             }
         }
         Ok(())
