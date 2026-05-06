@@ -1,7 +1,8 @@
 use anyhow::{Context, bail, ensure};
 use log::debug;
 use sha1::{Digest, Sha1};
-use std::fs::{self};
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -10,11 +11,11 @@ use super::object::*;
 
 
 
-#[derive(Debug, Clone, Copy)]
-pub enum FileType {
-    RegularFile,
-    SymbolicLink,
-}
+// #[derive(Debug, Clone, Copy)]
+// pub enum FileType {
+//     RegularFile,
+//     SymbolicLink,
+// }
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -25,9 +26,7 @@ pub struct Entry {
     dev: u32,        // device number
     ino: u32,        // inode number
     // TODO: git link
-    ftype: FileType, // 0b1000(regular file) 0b1010(symbolic link) 0b1110(git link)
-    // 9bit unix_permission, 0o755(executable) 0o644(not executable)
-    executable: bool,   // symbolic link and git link are 0 in this field
+    file_mode: FileMode,
     uid: u32,          //user id
     gid: u32,          // group id
     file_size: u32,    // >4GB is truncated
@@ -60,11 +59,8 @@ impl Entry {
     pub fn ino(&self) -> u32 {
         self.ino
     }
-    pub fn ftype(&self) -> FileType {
-        self.ftype
-    }
-    pub fn executable(&self) -> bool {
-        self.executable
+    pub fn file_mode(&self) -> FileMode {
+        self.file_mode
     }
     pub fn uid(&self) -> u32 {
         self.uid
@@ -93,6 +89,11 @@ impl Entry {
     /// Index 中存储的路径字节（相对工作区、Git 惯例下的 UTF-8 片段）。
     pub fn path(&self) -> &[u8] {
         &self.path
+    }
+
+    pub fn decode_entry_path(&self) -> PathBuf {
+        let s = String::from_utf8(self.path.clone()).unwrap();
+        PathBuf::from(s)
     }
 }
 
@@ -222,16 +223,6 @@ fn append_u16_be(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
-fn entry_mode_word(entry: &Entry) -> u32 {
-    match entry.ftype {
-        FileType::RegularFile => {
-            let perm = if entry.executable { 0o755 } else { 0o644 };
-            (0b1000u32 << 12) | perm
-        }
-        FileType::SymbolicLink => 0b1010u32 << 12,
-    }
-}
-
 fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
     let sha1 = match &entry.obj_name {
         ObjectSha::SHA1(h) => *h,
@@ -254,7 +245,7 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
         flags |= 0x4000;
     }
 
-    let mode_word = entry_mode_word(entry);
+    let mode_word = FileMode::to_index_binary(&entry.file_mode())?;
 
     let mut chunk = Vec::new();
     append_u32_be(&mut chunk, entry.ctime_sec);
@@ -294,27 +285,8 @@ fn get_entry(index_content: &[u8], i: &mut usize) -> Result<Entry, anyhow::Error
 
     let mode = read_u32_be(index_content, i)?;
     debug!("  get_entry: mode={:#010x}", mode);
-    let obj_type = ((mode >> 12) & 0xF) as u8;
-    let perm = mode & 0x1FF;
-    let fmode = match obj_type {
-        0b1000 => FileType::RegularFile,
-        0b1010 => FileType::SymbolicLink,
-        _ => bail!("invalid object type: {:#04b}", obj_type),
-    };
-    let executable = match fmode {
-        FileType::RegularFile => match perm {
-            0o644 => false,
-            0o755 => true,
-            _ => bail!("invalid regular file perm: {:#o} (mode={:#x})", perm, mode),
-        },
-        FileType::SymbolicLink => {
-            if perm != 0 {
-                bail!("invalid perm for symlink/gitlink: {:#o} (mode={:#x})", perm, mode);
-            }
-            false
-        }
-    };
-    debug!("  get_entry: ftype={:?} executable={}", fmode, executable);
+    let file_mode = FileMode::from_index_binary(mode).unwrap();
+    debug!("  get_entry: file_mode={:?}", file_mode);
 
     let uid = read_u32_be(index_content, i)?;
     debug!("  get_entry: uid={}", uid);
@@ -369,8 +341,7 @@ fn get_entry(index_content: &[u8], i: &mut usize) -> Result<Entry, anyhow::Error
         mtime_nsec,
         dev,
         ino,
-        ftype: fmode,
-        executable,
+        file_mode,
         uid,
         gid,
         file_size,
@@ -415,11 +386,7 @@ pub fn add_index(
     let dev = meta_data.dev() as u32;
     let ino = meta_data.ino() as u32;
 
-    let ftype = metadata_to_file_type(meta_data).unwrap();
-    let executable = match ftype {
-        FileType::RegularFile => meta_data.mode() & 0o100 != 0,
-        FileType::SymbolicLink => false,
-    };
+    let file_mode = FileMode::from_metadata(meta_data).unwrap();
 
     let uid = meta_data.uid();
     let gid = meta_data.gid();
@@ -445,8 +412,7 @@ pub fn add_index(
         mtime_nsec,
         dev,
         ino,
-        ftype,
-        executable,
+        file_mode,
         uid,
         gid,
         file_size,
@@ -534,12 +500,214 @@ fn skip_exact(buf: &[u8], i: &mut usize, n: usize) -> Result<()> {
     Ok(())
 }
 
-fn metadata_to_file_type(md: &fs::Metadata) -> Result<FileType> {
-    if md.is_symlink() {
-        return Ok(FileType::SymbolicLink);
+
+impl FileMode {
+    fn from_index_binary(binary: u32) -> Result<FileMode> {
+        match binary {
+            0o100644 => Ok(FileMode::NExecRegularFile),
+            0o100755 => Ok(FileMode::ExecRegularFile),
+            0o120000 => Ok(FileMode::SymbolicLink),
+            0o160000 => Ok(FileMode::Gitlink),
+            _ => bail!(format!("not a valid file mode binary in index file {:?}", binary))
+        }
     }
-    if md.is_file() {
-        return Ok(FileType::RegularFile);
+
+    fn to_index_binary(file_mode: &FileMode) -> Result<u32> {
+        match file_mode {
+            FileMode::NExecRegularFile => Ok(0o100644),
+            FileMode::ExecRegularFile => Ok(0o100755),
+            FileMode::SymbolicLink => Ok(0o120000),
+            FileMode::Gitlink => Ok(0o160000),
+            _ => bail!(format!("not a valid file mode in index file {:?}", file_mode))
+        }
     }
-    bail!("expected file or symlink");
+
+    fn from_metadata(meta_data: &fs::Metadata) -> Result<FileMode> {
+        if meta_data.is_symlink() {
+            return Ok(FileMode::SymbolicLink);
+        }
+
+        let executable = meta_data.mode() & 0o100 != 0;
+        if meta_data.is_file() && executable {
+            return Ok(FileMode::ExecRegularFile);
+        } else if meta_data.is_file() && !executable {
+            return Ok(FileMode::NExecRegularFile)
+        } else {
+            bail!("expected file or symlink");
+        }
+    }
+}
+
+pub mod index_tree {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::collections::btree_map;
+    use std::path::Components;
+
+    pub struct BlobLeaf {
+        // file_name: OsString,
+        file_mode: FileMode,
+        object_name: ObjectSha
+    }
+
+    impl BlobLeaf {
+        pub fn file_mode(&self) -> FileMode {
+            self.file_mode
+        }
+
+        pub fn object_name(&self) -> &ObjectSha {
+            &self.object_name
+        }
+
+        pub fn object_file_path(&self, git_dir: impl AsRef<Path>) -> PathBuf {
+            let hash = String::from_utf8(self.object_name.as_bytes().to_vec()).unwrap();
+            let object_dir_path = git_dir.as_ref().join("objects").join(&hash[0..2]);
+            let object_file_path = object_dir_path.join(&hash[2..]);
+            object_file_path
+        }
+    }
+
+
+    trait ChildrenMap {
+        
+    }
+
+    pub enum TreeNode {
+        Blob(BlobLeaf),
+        Tree(BTreeMap<OsString, TreeNode>)
+    }
+
+    impl TreeNode {
+        /// 自顶向下构造一条单链子树，末端为 blob。
+        /// 在本结点必须是 `Tree` 的前提下，沿父路径剩余分量把 `blob` 放进正确的子位置
+        pub fn insert_blob(
+            &mut self, 
+            parent_dir_iter: &mut Components<'_>, 
+            blob_file_name: OsString, 
+            blob: BlobLeaf
+        ) -> Result<()> {
+            let TreeNode::Tree(tree) = self else {
+                bail!("Blob无法被合并")
+            };
+            insert_blob_into_children_map(tree, parent_dir_iter, blob_file_name, blob)
+        }
+
+        pub fn write_tree_return_entry(&self, git_dir: impl AsRef<Path>, is_sha1: bool) -> TreeEntry {
+            match self {
+                TreeNode::Blob(b) => {
+                    TreeEntry{file_mode: b.file_mode, object_name: b.object_name.clone()}
+                }
+                TreeNode::Tree(children) => {
+                    let mut entries: BTreeMap<OsString, TreeEntry> = BTreeMap::new();
+                    for (file_name, child) in children {
+                        let entry = child.write_tree_return_entry(git_dir.as_ref(), is_sha1);
+                        entries.insert(file_name.clone(), entry);
+                    };
+                    let content = TreeObject::entries_to_binary(entries, is_sha1);
+                    let hash: [u8; 20] = Sha1::digest(&content).try_into().unwrap();
+                    let object_name = ObjectSha::SHA1(hash);
+                    write_hash_object(git_dir.as_ref(), &object_name, &content).unwrap();
+                    TreeEntry { file_mode: FileMode::Directory, object_name }
+                }
+            }
+        }
+    }
+
+    // 根在working_tree文件夹
+    pub struct IndexRootTree {
+        children: BTreeMap<OsString, TreeNode>
+    }
+
+    impl IndexRootTree {
+        /// 根结点下第一层子项（用于测试或调试时遍历整棵树）。
+        pub fn root_children(&self) -> &BTreeMap<OsString, TreeNode> {
+            &self.children
+        }
+
+        pub fn insert_blob(
+            &mut self, parent_dir_iter: 
+            &mut Components<'_>, 
+            blob_file_name: OsString, 
+            blob: BlobLeaf
+        ) -> Result<()> {
+            insert_blob_into_children_map(&mut self.children, parent_dir_iter, blob_file_name, blob)
+        }
+
+        pub fn from_index_file(index_file: &IndexFile) -> Result<IndexRootTree> {
+            let mut result = IndexRootTree{children: BTreeMap::new()};
+            for entry in index_file.entries() {
+                let path = entry.decode_entry_path();
+                let Some(file_name) = path.file_name() else {
+                    bail!("index文件中存在没有file_name的entry");
+                };
+                let blob = BlobLeaf { 
+                    // file_name: file_name.to_os_string(),
+                    file_mode: entry.file_mode(), 
+                    object_name: entry.obj_name().clone() 
+                };
+
+                let parent_path = path.parent().unwrap_or_else(|| Path::new(""));
+                let mut parent_dir_iter = parent_path.components();
+                result.insert_blob(&mut parent_dir_iter, file_name.to_owned(), blob).unwrap();
+            }
+
+            Ok(result)
+        }
+
+        pub fn write_tree(
+            &self, 
+            git_dir: impl AsRef<Path>, 
+            is_sha1: bool) 
+        -> Result<ObjectSha>
+        {
+            let entries = write_children_return_entries(&self.children, git_dir.as_ref(), is_sha1);
+            let content = TreeObject::entries_to_binary(entries, is_sha1);
+            let hash: [u8; 20] = Sha1::digest(&content).try_into()?;
+            let object_name = ObjectSha::SHA1(hash);
+            write_hash_object(git_dir.as_ref(), &object_name, &content)?;
+            Ok(object_name)
+        }
+    }
+
+    /// 在「当前这一层」的 map 上：按 `parent_dir_iter` 剩余分量插入/合并 `blob`。
+    fn insert_blob_into_children_map(
+        map: &mut BTreeMap<OsString, TreeNode>,
+        parent_dir_iter: &mut Components<'_>,
+        blob_file_name: OsString,
+        blob: BlobLeaf,
+    ) -> Result<()> {
+        let Some(child_name) = parent_dir_iter
+            .next()
+            .map(|c| c.as_os_str().to_owned())
+        else {
+            map.insert(blob_file_name, TreeNode::Blob(blob));
+            return Ok(());
+        };
+
+        match map.entry(child_name) {
+            btree_map::Entry::Occupied(mut e) => {
+                e.get_mut().insert_blob(parent_dir_iter, blob_file_name, blob)?;
+            }
+            btree_map::Entry::Vacant(e) => {
+                let mut child_map = BTreeMap::new();
+                insert_blob_into_children_map(&mut child_map, parent_dir_iter, blob_file_name, blob)?;
+                e.insert(TreeNode::Tree(child_map));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_children_return_entries(
+        children: &BTreeMap<OsString, TreeNode>, 
+        git_dir: impl AsRef<Path>, 
+        is_sha1: bool) 
+    -> BTreeMap<OsString, TreeEntry> 
+    {
+        let mut entries: BTreeMap<OsString, TreeEntry> = BTreeMap::new();
+        for (file_name, child) in children {
+            let entry = child.write_tree_return_entry(git_dir.as_ref(), is_sha1);
+            entries.insert(file_name.clone(), entry);
+        };
+        entries
+    }
 }
