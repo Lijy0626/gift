@@ -1,9 +1,15 @@
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::ffi::OsStr;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::bufread::ZlibDecoder;
+
 use crate::index;
+use crate::object::{self, FileMode, ObjectSha, TreeObject};
 
 fn make_case_dir(case_name: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -27,6 +33,58 @@ fn run_git(dir: &Path, args: &[&str]) {
         .expect("failed to run git");
 
     assert!(status.success(), "git {:?} failed", args);
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run git");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf-8 stdout")
+}
+
+/// `git ls-tree` 一行：`100644 blob <sha>\tname`
+fn parse_ls_tree_line(line: &str) -> (String, String, String, String) {
+    let (left, name) = line.split_once('\t').expect("ls-tree line must contain tab");
+    let mut it = left.split_whitespace();
+    let mode = it.next().expect("mode").to_string();
+    let obj_type = it.next().expect("type").to_string();
+    let sha = it.next().expect("sha").to_string();
+    assert!(it.next().is_none(), "unexpected extra fields: {line:?}");
+    (mode, obj_type, sha, name.to_string())
+}
+
+fn mode_word_to_file_mode(mode: &str) -> FileMode {
+    match mode {
+        "100644" => FileMode::NExecRegularFile,
+        "100755" => FileMode::ExecRegularFile,
+        "120000" => FileMode::SymbolicLink,
+        "160000" => FileMode::Gitlink,
+        // `git ls-tree` 对 tree 常用 6 位 `040000`；对象里 on-disk 常为 `40000`
+        "40000" | "040000" => FileMode::Directory,
+        other => panic!("unexpected ls-tree mode {other:?}"),
+    }
+}
+
+/// 使用 `ls-tree -z`，路径为原始 UTF-8（非 ASCII 不会被 `"\345..."` 转义）。
+fn git_ls_tree_map(dir: &Path, tree_oid: &str) -> BTreeMap<String, (String, String, String)> {
+    let stdout = git_stdout(dir, &["ls-tree", "-z", tree_oid]);
+    let mut m = BTreeMap::new();
+    for chunk in stdout.split_terminator('\0') {
+        if chunk.is_empty() {
+            continue;
+        }
+        let (mode, obj_type, sha, name) = parse_ls_tree_line(chunk);
+        m.insert(name, (mode, obj_type, sha));
+    }
+    m
 }
 
 #[test]
@@ -145,5 +203,107 @@ fn stage_paths_roundtrip_index() {
             loose.display()
         );
     }
+}
+
+/// 用真实 `git write-tree` 产生的 tree loose object，校验 `read_object_type` + `read_tree` 与 `git ls-tree` 一致（含 `100755` 与 `120000`）。
+#[cfg(unix)]
+#[test]
+fn cmp_read_tree_matches_git_ls_tree() {
+    use std::os::unix::fs::symlink;
+
+    // 准备测试环境
+    let case_dir = make_case_dir("read_tree");
+    let git_dir = case_dir.join(".git");
+
+    fs::write(case_dir.join("a.txt"), "hello\n").unwrap();
+    fs::create_dir_all(case_dir.join("foo").join("啊")).unwrap();
+    fs::write(
+        case_dir.join("foo").join("啊").join("bar"),
+        "你好！aa\n",
+    )
+    .unwrap();
+    fs::write(case_dir.join("script.sh"), "#!/bin/sh\necho ok\n").unwrap();
+    symlink("a.txt", case_dir.join("link")).expect("symlink link -> a.txt");
+
+    let chmod_ok = Command::new("chmod")
+        .args(["+x", "script.sh"])
+        .current_dir(&case_dir)
+        .status()
+        .expect("chmod");
+    assert!(chmod_ok.success(), "chmod +x script.sh");
+
+    // 执行git指令
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "."]);
+
+    let root_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .expect("write-tree line")
+        .trim()
+        .to_string();
+    assert_eq!(root_hex.len(), 40, "root tree oid hex length");
+
+    // 得到git cat-file的结果
+    let cat_t = git_stdout(&case_dir, &["cat-file", "-t", &root_hex])
+        .trim()
+        .to_string();
+    assert_eq!(cat_t, "tree");
+
+    // 得到git ls-tree的结果
+    let expected_root = git_ls_tree_map(&case_dir, &root_hex);
+    // 用我们实现的函数去读取得到的结果
+    let tree_root = TreeObject::read_loose_tree(&git_dir, &root_hex);
+
+    assert_eq!(
+        hex::encode(tree_root.object_name().as_bytes()),
+        root_hex,
+        "TreeObject carries the opened oid"
+    );
+    assert_eq!(
+        tree_root.entries().len(),
+        expected_root.len(),
+        "root entry count vs git ls-tree"
+    );
+
+    for (name, entry) in tree_root.entries() {
+        let key = name.to_str().expect("utf-8 name in fixture");
+        let (mode, obj_type, sha) = expected_root
+            .get(key)
+            .unwrap_or_else(|| panic!("unexpected entry {key:?}"));
+        assert_eq!(
+            mode_word_to_file_mode(mode),
+            entry.file_mode,
+            "mode for {key}"
+        );
+        assert_eq!(hex::encode(entry.object_name.as_bytes()), *sha, "sha {key}");
+        match entry.file_mode {
+            FileMode::Directory => assert_eq!(obj_type, "tree"),
+            FileMode::SymbolicLink | FileMode::NExecRegularFile | FileMode::ExecRegularFile => {
+                assert_eq!(obj_type, "blob");
+            }
+            _ => panic!("unexpected FileMode in fixture"),
+        }
+    }
+
+    // 子 tree：foo -> 啊 -> bar
+    let (_, _, foo_tree_sha) = expected_root.get("foo").expect("foo tree");
+    let expected_foo = git_ls_tree_map(&case_dir, foo_tree_sha);
+    let tree_foo = TreeObject::read_loose_tree(&git_dir, foo_tree_sha);
+    assert_eq!(tree_foo.entries().len(), expected_foo.len());
+    assert_eq!(tree_foo.entries().len(), 1, "foo/ only contains 啊");
+
+    let (_, _, ah_tree_sha) = expected_foo
+        .get("啊")
+        .expect("啊 tree under foo");
+    let expected_ah = git_ls_tree_map(&case_dir, ah_tree_sha);
+    let tree_ah = TreeObject::read_loose_tree(&git_dir, ah_tree_sha);
+    assert_eq!(tree_ah.entries().len(), 1);
+    assert_eq!(tree_ah.entries().len(), expected_ah.len());
+
+    let bar_entry = tree_ah.entries().get(OsStr::new("bar")).expect("bar blob");
+    assert_eq!(bar_entry.file_mode, FileMode::NExecRegularFile);
+    let (_, _, bar_sha) = expected_ah.get("bar").unwrap();
+    assert_eq!(hex::encode(bar_entry.object_name.as_bytes()), *bar_sha);
 }
 
