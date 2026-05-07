@@ -316,7 +316,7 @@ fn format_identity_line(prefix: &str, id: &CommitIdentity) -> String {
 
 /// 从 zlib 解压流上读取 object 类型名（`blob` / `tree` / …），类似 `git cat-file -t`
 /// 必须与同一 `BufReader<&mut ZlibDecoder<_>>` 上后续的 `read_tree`、`read_commit` 等解析共用，勿另包一层 `BufReader`。
-pub fn read_object_type<R: BufRead>(
+fn read_object_type<R: BufRead>(
     reader: &mut BufReader<&mut ZlibDecoder<R>>,
 ) -> anyhow::Result<String> {
     let mut buf = Vec::new();
@@ -330,6 +330,20 @@ pub fn skip_git_object_size_nul<R: BufRead>(reader: &mut R) -> anyhow::Result<()
     let mut buf = Vec::new();
     reader.read_until(b'\0', &mut buf)?;
     Ok(())
+}
+
+/// 读取 `.git/objects` 下 loose 对象的类型名（`commit` / `tree` / `blob` / …）
+pub fn read_loose_object_kind(git_dir: &Path, oid: &ObjectSha) -> Result<String> {
+    let hex = hex::encode(oid.as_bytes());
+    let loose = git_dir
+        .join("objects")
+        .join(&hex[0..2])
+        .join(&hex[2..]);
+    let f = File::open(&loose).with_context(|| format!("open object {}", loose.display()))?;
+    let raw = BufReader::new(f);
+    let mut zlib = ZlibDecoder::new(raw);
+    let mut br = BufReader::new(&mut zlib);
+    read_object_type(&mut br)
 }
 
 pub struct BlobObject {

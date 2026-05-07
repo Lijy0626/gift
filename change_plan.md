@@ -30,7 +30,7 @@ commit_message
 1. 新增`struct Ref`  
 ```rust
 pub struct Ref {
-    name: String,
+    path: PathBuf,
     commit_id: ObjectSha
 }
 ```  
@@ -56,7 +56,7 @@ pub struct SymbolicRef {
 新增`enum Head`, 对应`.git/HEAD`中的内容
 ```rust
 enum Head {
-    TargetBrach(Ref),
+    TargetBranch(Ref),
     TargetCommit(ObjectHash)
 }
 ```

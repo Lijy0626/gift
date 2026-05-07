@@ -13,6 +13,7 @@ use flate2::bufread::ZlibDecoder;
 use crate::object::{
     commit_tree, CommitIdentity, CommitObject, FileMode, ObjectSha, TreeObject,
 };
+use crate::reference::{branch_ref_path, read_ref, update_ref};
 
 fn make_case_dir(case_name: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -51,6 +52,13 @@ fn decompress_loose_object(git_dir: &Path, hex_oid: &str) -> Vec<u8> {
     raw
 }
 
+/// 在指定工作目录下调用系统的 git commit-tree，并固定 author/committer 环境变量，
+/// 返回新产生的 commit 的 SHA（40 位 hex 字符串）。
+/// 参数: 
+///      dir：仓库根目录,   
+///      tree：根 tree 的 OID 字符串（通常来自 git write-tree), 
+///      parents：父 commit 列表
+///      msg：-m 后面的提交说明
 fn git_commit_tree_with_env(dir: &Path, tree: &str, parents: &[&str], msg: &str) -> String {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir)
@@ -620,5 +628,99 @@ fn commit_tree_writes_loose_object() {
     assert_eq!(round.tree, tree_sha);
     assert_eq!(round.message, commit.message);
     assert_eq!(decompress_loose_object(&git_dir, &hex_out), commit.to_binary());
+}
+
+#[test]
+fn branch_ref_path_joins_heads() {
+    assert_eq!(
+        branch_ref_path("main"),
+        PathBuf::from("refs/heads/main")
+    );
+}
+
+/// `read_ref` 与 `git update-ref` 一致；`update_ref` 写入后 `git rev-parse` 一致。
+#[test]
+fn read_ref_and_update_ref_match_git() {
+    let case_dir = make_case_dir("git_ref_update");
+    let git_dir = case_dir.join(".git");
+
+    fs::write(case_dir.join("f.txt"), "x\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "f.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let c0 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "c0");
+    let ref_path = branch_ref_path("mine");
+
+    run_git(
+        &case_dir,
+        &["update-ref", &format!("refs/heads/mine"), &c0],
+    );
+
+    let r = read_ref(&git_dir, &ref_path).expect("read_ref");
+    assert_eq!(r.path, ref_path);
+    assert_eq!(hex::encode(r.commit_id.as_bytes()), c0);
+
+    let c1 = git_commit_tree_with_env(&case_dir, &tree_hex, &[&c0], "c1");
+    update_ref(&git_dir, &ref_path, &ObjectSha::SHA1(
+        hex::decode(&c1).unwrap().try_into().unwrap(),
+    ))
+    .expect("update_ref");
+
+    let rev = git_stdout(&case_dir, &["rev-parse", "refs/heads/mine"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(rev, c1);
+    let r2 = read_ref(&git_dir, &ref_path).expect("read_ref after gift update_ref");
+    assert_eq!(hex::encode(r2.commit_id.as_bytes()), c1);
+}
+
+/// `update_ref` 要求目标为 commit，不能指向 tree。
+#[test]
+fn update_ref_rejects_non_commit_object() {
+    let case_dir = make_case_dir("ref_reject_tree");
+    let git_dir = case_dir.join(".git");
+
+    fs::write(case_dir.join("f.txt"), "y\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "f.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let tree_sha = ObjectSha::SHA1(hex::decode(&tree_hex).unwrap().try_into().unwrap());
+    let err = update_ref(&git_dir, branch_ref_path("bad"), &tree_sha).unwrap_err();
+    assert!(
+        err.to_string().contains("commit") || err.to_string().contains("tree"),
+        "unexpected err: {err:?}"
+    );
+}
+
+/// 含 `ref:` 的 symbolic ref 文件不由 `read_ref` 解析。
+#[test]
+fn read_ref_rejects_symbolic_file() {
+    let case_dir = make_case_dir("ref_reject_sym");
+    let git_dir = case_dir.join(".git");
+    run_git(&case_dir, &["init"]);
+
+    let p = branch_ref_path("sym");
+    let full = git_dir.join(&p);
+    fs::create_dir_all(full.parent().unwrap()).unwrap();
+    fs::write(&full, "ref: refs/heads/main\n").unwrap();
+
+    let err = read_ref(&git_dir, &p).unwrap_err();
+    assert!(
+        err.to_string().contains("symbolic") || err.to_string().contains("direct"),
+        "unexpected err: {err:?}"
+    );
 }
 
