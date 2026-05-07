@@ -567,27 +567,12 @@ pub mod index_tree {
         }
     }
 
-
-    trait ChildrenMap {
-        
-    }
-
     pub enum TreeNode {
         Blob(BlobLeaf),
         Tree(BTreeMap<OsString, TreeNode>)
     }
 
     impl TreeNode {
-        /// 自顶向下构造一条单链子树，末端为 blob。
-        pub fn build_from_parent(parent_dir_iter: &mut Components<'_>, blob: BlobLeaf) -> TreeNode {
-            let Some(child_name) =  parent_dir_iter.next().map(|x|x.as_os_str().to_owned()) else {
-                return TreeNode::Blob(blob)
-            };
-            let mut result: BTreeMap<OsString, TreeNode> = BTreeMap::new();
-            result.insert(child_name, Self::build_from_parent(parent_dir_iter, blob));
-            return TreeNode::Tree(result)
-        }
-
         /// 在本结点必须是 `Tree` 的前提下，沿父路径剩余分量把 `blob` 放进正确的子位置
         pub fn insert_blob(
             &mut self, 
@@ -698,7 +683,9 @@ pub mod index_tree {
                 e.get_mut().insert_blob(parent_dir_iter, blob_file_name, blob)?;
             }
             btree_map::Entry::Vacant(e) => {
-                e.insert(TreeNode::build_from_parent(parent_dir_iter, blob));
+                let mut child_map = BTreeMap::new();
+                insert_blob_into_children_map(&mut child_map, parent_dir_iter, blob_file_name, blob)?;
+                e.insert(TreeNode::Tree(child_map));
             }
         }
         Ok(())
