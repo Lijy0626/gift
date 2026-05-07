@@ -2,7 +2,7 @@ use anyhow::{Context, bail, ensure};
 use log::debug;
 use sha1::{Digest, Sha1};
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;

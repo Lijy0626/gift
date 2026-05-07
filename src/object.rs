@@ -5,20 +5,14 @@ use flate2::Compression;
 use sha1::{Digest, Sha1};
 
 use std::collections::BTreeMap;
-use std::default;
-use std::fs::{self, File, read};
+use std::fs::{self, File};
 use std::io::{BufReader, prelude::*};
-use std::panic::resume_unwind;
-use std::path::{Components, Path, PathBuf};
-use std::ffi::{OsStr, OsString};
+use std::path::Path;
+use std::ffi::OsString;
 
-use std::str::FromStr;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
-
-use crate::{index, object};
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileMode {
@@ -47,12 +41,281 @@ impl ObjectSha {
 pub enum Object {
     Blob(BlobObject),
     Tree(TreeObject),
-    Commit, // TODO
-    Tag,    // TODO
+    Commit(CommitObject),
+    Tag, // TODO
+}
+
+/// author / committer 行中的「姓名 + 邮箱 + 时间 + 时区」
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+    pub unix_time: i64,
+    pub tz: String,
+}
+
+/// 磁盘上的 commit 对象：tree、若干 parent、作者信息、commit message
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitObject {
+    object_name: ObjectSha,
+    pub tree: ObjectSha,
+    pub parents: Vec<ObjectSha>,
+    pub author: CommitIdentity,
+    pub committer: CommitIdentity,
+    /// author/committer 之后、空行之前的其它 header（整行，不含 `\n`）
+    pub trailing_headers: Vec<String>,
+    pub message: Vec<u8>,
+}
+
+impl CommitObject {
+    pub fn object_name(&self) -> &ObjectSha {
+        &self.object_name
+    }
+
+    /// 构造待写入的 commit（`object_name` 占位；落盘后用 `read_loose_commit` 或 `commit_tree` 的返回值）
+    pub fn new(
+        tree: ObjectSha,
+        parents: Vec<ObjectSha>,
+        author: CommitIdentity,
+        committer: CommitIdentity,
+        trailing_headers: Vec<String>,
+        message: Vec<u8>,
+    ) -> Self {
+        Self {
+            object_name: ObjectSha::SHA1([0u8; 20]),
+            tree,
+            parents,
+            author,
+            committer,
+            trailing_headers,
+            message,
+        }
+    }
+
+    /// 从 zlib 解压后的 commit payload 流解析（调用方已跳过 `commit <size>\0` 头）
+    pub fn read_commit<R: BufRead>(
+        object_name: ObjectSha,
+        reader: &mut BufReader<&mut ZlibDecoder<R>>,
+        is_sha1: bool,
+    ) -> Result<CommitObject> {
+        let mut headers: Vec<ParsedHeader> = Vec::new();
+        let mut line_buf: Vec<u8> = Vec::new();
+        loop {
+            line_buf.clear();
+            let n = reader.read_until(b'\n', &mut line_buf)?;
+            if n == 0 {
+                bail!("unexpected EOF in commit headers");
+            }
+            if line_buf == [b'\n'] {
+                break;
+            }
+            if !line_buf.ends_with(b"\n") {
+                bail!("commit header line missing newline");
+            }
+            let line = std::str::from_utf8(&line_buf[..line_buf.len() - 1])?;
+            headers.push(parse_header_line(line, is_sha1)?);
+        }
+
+        let mut message = Vec::new();
+        reader.read_to_end(&mut message)?;
+
+        let mut tree: Option<ObjectSha> = None;
+        let mut parents: Vec<ObjectSha> = Vec::new();
+        let mut author: Option<CommitIdentity> = None;
+        let mut committer: Option<CommitIdentity> = None;
+        let mut trailing_headers: Vec<String> = Vec::new();
+
+        for h in headers {
+            match h {
+                ParsedHeader::Tree(t) => {
+                    if tree.replace(t).is_some() {
+                        bail!("duplicate tree line in commit");
+                    }
+                }
+                ParsedHeader::Parent(p) => parents.push(p),
+                ParsedHeader::Author(a) => {
+                    if author.replace(a).is_some() {
+                        bail!("duplicate author line in commit");
+                    }
+                }
+                ParsedHeader::Committer(c) => {
+                    if committer.replace(c).is_some() {
+                        bail!("duplicate committer line in commit");
+                    }
+                }
+                ParsedHeader::Other(s) => trailing_headers.push(s),
+            }
+        }
+
+        let tree = tree.context("commit missing tree")?;
+        let author = author.context("commit missing author")?;
+        let committer = committer.context("commit missing committer")?;
+
+        Ok(CommitObject {
+            object_name,
+            tree,
+            parents,
+            author,
+            committer,
+            trailing_headers,
+            message,
+        })
+    }
+
+    /// 完整 loose object 字节（含 `commit <len>\0` 头），用于哈希与写入 `.git/objects`
+    pub fn to_binary(&self) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(b"tree ");
+        body.extend_from_slice(hex::encode(self.tree.as_bytes()).as_bytes());
+        body.push(b'\n');
+        for p in &self.parents {
+            body.extend_from_slice(b"parent ");
+            body.extend_from_slice(hex::encode(p.as_bytes()).as_bytes());
+            body.push(b'\n');
+        }
+        body.extend_from_slice(format_identity_line("author", &self.author).as_bytes());
+        body.extend_from_slice(format_identity_line("committer", &self.committer).as_bytes());
+        for line in &self.trailing_headers {
+            body.extend_from_slice(line.as_bytes());
+            body.push(b'\n');
+        }
+        body.push(b'\n');
+        body.extend_from_slice(&self.message);
+
+        let header = format!("commit {}\0", body.len()).into_bytes();
+        let mut out = Vec::with_capacity(header.len() + body.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// 读取 `.git/objects` 下的 loose commit（与 `read_loose_tree` 同层）
+    pub fn read_loose_commit(repo: &Path, hex_oid: &str) -> CommitObject {
+        let is_sha1 = hex_oid.len() == 40;
+        let loose = repo
+            .join("objects")
+            .join(&hex_oid[0..2])
+            .join(&hex_oid[2..]);
+        assert!(
+            loose.is_file(),
+            "loose object missing: {}",
+            loose.display()
+        );
+
+        let f = File::open(&loose).expect("open loose object");
+        let raw = BufReader::new(f);
+        let mut zlib = ZlibDecoder::new(raw);
+        let mut br = BufReader::new(&mut zlib);
+
+        let kind = read_object_type(&mut br).expect("read type");
+        assert_eq!(kind, "commit", "cat-file -t should be commit");
+
+        skip_git_object_size_nul(&mut br).expect("skip size\\0");
+
+        let object_name = if is_sha1 {
+            let oid_bytes: [u8; 20] = hex::decode(hex_oid)
+                .expect("hex oid")
+                .try_into()
+                .expect("oid len");
+            ObjectSha::SHA1(oid_bytes)
+        } else {
+            let oid_bytes: [u8; 32] = hex::decode(hex_oid)
+                .expect("hex oid")
+                .try_into()
+                .expect("oid len");
+            ObjectSha::SHA256(oid_bytes)
+        };
+
+        CommitObject::read_commit(object_name, &mut br, is_sha1).expect("read_commit")
+    }
+}
+
+/// `to_binary` 后算 SHA1、写入 objects 目录，返回新对象的 `ObjectSha`
+pub fn commit_tree(git_dir: impl AsRef<Path>, commit: &CommitObject) -> Result<ObjectSha> {
+    let bytes = commit.to_binary();
+    let hash: [u8; 20] = Sha1::digest(&bytes).try_into().unwrap();
+    let oid = ObjectSha::SHA1(hash);
+    write_hash_object(git_dir, &oid, &bytes)?;
+    Ok(oid)
+}
+
+enum ParsedHeader {
+    Tree(ObjectSha),
+    Parent(ObjectSha),
+    Author(CommitIdentity),
+    Committer(CommitIdentity),
+    Other(String),
+}
+
+fn parse_header_line(line: &str, is_sha1: bool) -> Result<ParsedHeader> {
+    if let Some(hex) = line.strip_prefix("tree ") {
+        return Ok(ParsedHeader::Tree(parse_oid_hex(hex.trim(), is_sha1)?));
+    }
+    if let Some(hex) = line.strip_prefix("parent ") {
+        return Ok(ParsedHeader::Parent(parse_oid_hex(hex.trim(), is_sha1)?));
+    }
+    if let Some(rest) = line.strip_prefix("author ") {
+        return Ok(ParsedHeader::Author(parse_identity(rest)?));
+    }
+    if let Some(rest) = line.strip_prefix("committer ") {
+        return Ok(ParsedHeader::Committer(parse_identity(rest)?));
+    }
+    Ok(ParsedHeader::Other(line.to_string()))
+}
+
+fn parse_oid_hex(word: &str, is_sha1: bool) -> Result<ObjectSha> {
+    let expected = if is_sha1 { 40 } else { 64 };
+    if word.len() != expected {
+        bail!("bad object id hex length: got {}, want {}", word.len(), expected);
+    }
+    let v = hex::decode(word)?;
+    if is_sha1 {
+        let bytes: [u8; 20] = v
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("tree/parent oid: want 20 bytes, got {}", v.len()))?;
+        Ok(ObjectSha::SHA1(bytes))
+    } else {
+        let bytes: [u8; 32] = v
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("tree/parent oid: want 32 bytes, got {}", v.len()))?;
+        Ok(ObjectSha::SHA256(bytes))
+    }
+}
+
+fn parse_identity(s: &str) -> Result<CommitIdentity> {
+    let idx = s.rfind('>').context("identity line: missing '>'")?;
+    let name_email = s[..idx].trim_end();
+    let tail = s[idx + 1..].trim();
+    let mut it = tail.split_whitespace();
+    let unix: i64 = it.next().context("identity: missing unix time")?.parse()?;
+    let tz = it
+        .next()
+        .context("identity: missing timezone")?
+        .to_string();
+    if it.next().is_some() {
+        bail!("identity: unexpected trailing fields");
+    }
+
+    let lt = name_email.rfind('<').context("identity: missing '<'")?;
+    let name = name_email[..lt].trim().to_string();
+    let email = name_email[lt + 1..].trim().to_string();
+    Ok(CommitIdentity {
+        name,
+        email,
+        unix_time: unix,
+        tz,
+    })
+}
+
+fn format_identity_line(prefix: &str, id: &CommitIdentity) -> String {
+    format!(
+        "{} {} <{}> {} {}\n",
+        prefix, id.name, id.email, id.unix_time, id.tz
+    )
 }
 
 /// 从 zlib 解压流上读取 object 类型名（`blob` / `tree` / …），类似 `git cat-file -t`
-/// 必须与同一 `BufReader<&mut ZlibDecoder<_>>` 上后续的 `read_tree` 等解析共用，勿另包一层 `BufReader`。
+/// 必须与同一 `BufReader<&mut ZlibDecoder<_>>` 上后续的 `read_tree`、`read_commit` 等解析共用，勿另包一层 `BufReader`。
 pub fn read_object_type<R: BufRead>(
     reader: &mut BufReader<&mut ZlibDecoder<R>>,
 ) -> anyhow::Result<String> {
@@ -204,10 +467,10 @@ impl TreeObject {
         let mut zlib = ZlibDecoder::new(raw);
         let mut br = BufReader::new(&mut zlib);
 
-        let kind = object::read_object_type(&mut br).expect("read type");
+        let kind = read_object_type(&mut br).expect("read type");
         assert_eq!(kind, "tree", "cat-file -t should be tree");
 
-        object::skip_git_object_size_nul(&mut br).expect("skip size\\0");
+        skip_git_object_size_nul(&mut br).expect("skip size\\0");
 
         let oid_bytes: [u8; 20] = hex::decode(hex_oid)
             .expect("hex oid")

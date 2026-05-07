@@ -2,12 +2,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::index;
 use crate::index::index_tree::{IndexRootTree, TreeNode};
-use crate::object::{FileMode, ObjectSha, TreeObject};
+use flate2::bufread::ZlibDecoder;
+
+use crate::object::{
+    commit_tree, CommitIdentity, CommitObject, FileMode, ObjectSha, TreeObject,
+};
 
 fn make_case_dir(case_name: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -31,6 +36,49 @@ fn run_git(dir: &Path, args: &[&str]) {
         .expect("failed to run git");
 
     assert!(status.success(), "git {:?} failed", args);
+}
+
+/// zlib 解压后的完整 loose object 字节（含 `type len\0` 头）
+fn decompress_loose_object(git_dir: &Path, hex_oid: &str) -> Vec<u8> {
+    let loose = git_dir
+        .join("objects")
+        .join(&hex_oid[0..2])
+        .join(&hex_oid[2..]);
+    let f = fs::File::open(&loose).expect("open loose object");
+    let mut zlib = ZlibDecoder::new(std::io::BufReader::new(f));
+    let mut raw = Vec::new();
+    zlib.read_to_end(&mut raw).expect("decompress");
+    raw
+}
+
+fn git_commit_tree_with_env(dir: &Path, tree: &str, parents: &[&str], msg: &str) -> String {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test Author")
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_AUTHOR_DATE", "1700000000 +0800")
+        .env("GIT_COMMITTER_NAME", "Test Committer")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0800")
+        .arg("commit-tree")
+        .arg(tree);
+    for p in parents {
+        cmd.arg("-p").arg(p);
+    }
+    cmd.args(["-m", msg]);
+    let out = cmd.output().expect("git commit-tree");
+    assert!(
+        out.status.success(),
+        "git commit-tree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("utf-8")
+        .lines()
+        .next()
+        .expect("commit oid line")
+        .trim()
+        .to_string()
 }
 
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
@@ -455,5 +503,122 @@ fn from_index_file_write_tree_matches_git_write_tree() {
     assert_eq!(bar_entry.file_mode, FileMode::NExecRegularFile);
     let (_, _, bar_sha) = expected_ah.get("bar").unwrap();
     assert_eq!(hex::encode(bar_entry.object_name.as_bytes()), *bar_sha);
+}
+
+/// `git commit-tree` 生成的 loose commit：`read_loose_commit` 字段一致，且 `to_binary` 与解压字节一致。
+#[test]
+fn read_commit_matches_git_commit_tree() {
+    let case_dir = make_case_dir("read_commit");
+    let git_dir = case_dir.join(".git");
+
+    fs::write(case_dir.join("f.txt"), "content\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "f.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let c1 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "first commit");
+    assert_eq!(c1.len(), 40);
+
+    let raw1 = decompress_loose_object(&git_dir, &c1);
+    let parsed1 = CommitObject::read_loose_commit(&git_dir, &c1);
+    assert_eq!(hex::encode(parsed1.object_name().as_bytes()), c1);
+    assert_eq!(parsed1.parents.len(), 0);
+    assert_eq!(parsed1.message, b"first commit\n");
+    assert_eq!(parsed1.author.name, "Test Author");
+    assert_eq!(parsed1.committer.email, "committer@example.com");
+    assert_eq!(parsed1.to_binary(), raw1);
+
+    let c2 = git_commit_tree_with_env(&case_dir, &tree_hex, &[&c1], "second commit");
+    let parsed2 = CommitObject::read_loose_commit(&git_dir, &c2);
+    assert_eq!(parsed2.parents.len(), 1);
+    assert_eq!(
+        hex::encode(parsed2.parents[0].as_bytes()),
+        c1,
+        "single parent oid"
+    );
+    assert_eq!(parsed2.to_binary(), decompress_loose_object(&git_dir, &c2));
+}
+
+/// 合并提交两个 parent：顺序与 `git commit-tree -p A -p B` 一致。
+#[test]
+fn read_commit_merge_two_parents() {
+    let case_dir = make_case_dir("commit_merge_parents");
+    let git_dir = case_dir.join(".git");
+
+    fs::write(case_dir.join("x.txt"), "x\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "x.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let p1 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "branch one");
+    let p2 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "branch two");
+    let merge = git_commit_tree_with_env(&case_dir, &tree_hex, &[&p1, &p2], "merge both");
+
+    let parsed = CommitObject::read_loose_commit(&git_dir, &merge);
+    assert_eq!(parsed.parents.len(), 2);
+    assert_eq!(hex::encode(parsed.parents[0].as_bytes()), p1);
+    assert_eq!(hex::encode(parsed.parents[1].as_bytes()), p2);
+    assert_eq!(parsed.to_binary(), decompress_loose_object(&git_dir, &merge));
+}
+
+/// `commit_tree`：写入 objects 后 OID 与 `to_binary` 的 SHA1 一致。
+#[test]
+fn commit_tree_writes_loose_object() {
+    let case_dir = make_case_dir("commit_tree_fn");
+    let git_dir = case_dir.join(".git");
+
+    fs::write(case_dir.join("blob.txt"), "blob\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "blob.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let tree_oid: [u8; 20] = hex::decode(&tree_hex).unwrap().try_into().unwrap();
+    let tree_sha = ObjectSha::SHA1(tree_oid);
+
+    let commit = CommitObject::new(
+        tree_sha.clone(),
+        Vec::new(),
+        CommitIdentity {
+            name: "A".into(),
+            email: "a@b.c".into(),
+            unix_time: 1_700_000_001,
+            tz: "+0000".into(),
+        },
+        CommitIdentity {
+            name: "C".into(),
+            email: "c@d.e".into(),
+            unix_time: 1_700_000_001,
+            tz: "+0000".into(),
+        },
+        Vec::new(),
+        b"gift commit-tree test\n".to_vec(),
+    );
+
+    let oid = commit_tree(&git_dir, &commit).expect("commit_tree");
+    let hex_out = hex::encode(oid.as_bytes());
+    let loose = git_dir
+        .join("objects")
+        .join(&hex_out[0..2])
+        .join(&hex_out[2..]);
+    assert!(loose.is_file(), "loose commit written");
+
+    let round = CommitObject::read_loose_commit(&git_dir, &hex_out);
+    assert_eq!(round.tree, tree_sha);
+    assert_eq!(round.message, commit.message);
+    assert_eq!(decompress_loose_object(&git_dir, &hex_out), commit.to_binary());
 }
 
