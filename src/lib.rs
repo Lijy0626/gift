@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+pub mod git_paths;
 pub mod object;
 pub mod symbolic_ref;
 pub mod reference;

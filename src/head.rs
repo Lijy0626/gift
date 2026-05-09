@@ -5,11 +5,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::git_paths::{head_rel_path, worktree_path_to_git_path, git_path_to_worktree_path};
 use crate::object::ObjectSha;
 use crate::reference::{read_ref, update_ref};
-use crate::symbolic_ref::{
-    read_symbolic_ref, ref_file_to_ref_name, ref_name_to_sym_file, write_symbolic_ref, SymbolicRef,
-};
+use crate::symbolic_ref::{read_symbolic_ref, write_symbolic_ref, SymbolicRef};
 
 /// 与 `HEAD` 文件内容对应；`branch_ref_path` 为相对 worktree 的 tip ref 文件（如 `.git/refs/heads/main`）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,21 +18,16 @@ pub enum Head {
 }
 
 impl Head {
-    /// `git_dir/HEAD`（相对 worktree）
-    fn head_file_rel(git_dir: impl AsRef<Path>) -> PathBuf {
-        git_dir.as_ref().join("HEAD")
-    }
-
     /// 从磁盘读取并解析 `HEAD`
     pub fn read(worktree: &Path, git_dir: impl AsRef<Path>) -> Result<Head> {
-        let head_rel = Self::head_file_rel(git_dir.as_ref());
+        let head_rel = head_rel_path(git_dir.as_ref());
         let full = worktree.join(&head_rel);
         let content =
             fs::read_to_string(&full).with_context(|| format!("read HEAD {}", full.display()))?;
         let line = content.trim();
         if line.starts_with("ref:") {
             let sym = read_symbolic_ref(worktree, &head_rel)?;
-            let branch_ref_path = ref_name_to_sym_file(git_dir.as_ref(), &sym.ref_name);
+            let branch_ref_path = git_path_to_worktree_path(git_dir.as_ref(), &sym.ref_name);
             Ok(Head::TargetBranch { branch_ref_path })
         } else {
             let line = line.trim_end_matches(['\r', '\n']);
@@ -66,10 +60,10 @@ impl Head {
 
     /// 将 `Head` 写回 `HEAD` 文件
     pub fn write(&self, worktree: &Path, git_dir: impl AsRef<Path>) -> Result<()> {
-        let head_rel = Self::head_file_rel(git_dir.as_ref());
+        let head_rel = head_rel_path(git_dir.as_ref());
         match self {
             Head::TargetBranch { branch_ref_path } => {
-                let ref_name = ref_file_to_ref_name(worktree, git_dir.as_ref(), branch_ref_path)?;
+                let ref_name = worktree_path_to_git_path(worktree, git_dir.as_ref(), branch_ref_path)?;
                 write_symbolic_ref(
                     worktree,
                     &head_rel,

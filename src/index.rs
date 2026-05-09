@@ -1,4 +1,5 @@
 use anyhow::{Context, bail, ensure};
+use hex;
 use log::debug;
 use sha1::{Digest, Sha1};
 use std::ffi::OsString;
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use std::os::unix::fs::MetadataExt;
+use super::git_paths;
 use super::object::*;
 
 
@@ -560,10 +562,8 @@ pub mod index_tree {
         }
 
         pub fn object_file_path(&self, git_dir: impl AsRef<Path>) -> PathBuf {
-            let hash = String::from_utf8(self.object_name.as_bytes().to_vec()).unwrap();
-            let object_dir_path = git_dir.as_ref().join("objects").join(&hash[0..2]);
-            let object_file_path = object_dir_path.join(&hash[2..]);
-            object_file_path
+            let hash = hex::encode(self.object_name.as_bytes());
+            git_paths::loose_object_path(git_dir.as_ref(), &hash)
         }
     }
 

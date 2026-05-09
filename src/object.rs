@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, prelude::*};
 use std::path::Path;
+
+use crate::git_paths;
 use std::ffi::OsString;
 
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -192,10 +194,7 @@ impl CommitObject {
     /// 读取 `.git/objects` 下的 loose commit（与 `read_loose_tree` 同层）
     pub fn read_loose_commit(repo: &Path, hex_oid: &str) -> CommitObject {
         let is_sha1 = hex_oid.len() == 40;
-        let loose = repo
-            .join("objects")
-            .join(&hex_oid[0..2])
-            .join(&hex_oid[2..]);
+        let loose = git_paths::loose_object_path(repo, hex_oid);
         assert!(
             loose.is_file(),
             "loose object missing: {}",
@@ -335,10 +334,7 @@ pub fn skip_git_object_size_nul<R: BufRead>(reader: &mut R) -> anyhow::Result<()
 /// 读取 `.git/objects` 下 loose 对象的类型名（`commit` / `tree` / `blob` / …）
 pub fn read_loose_object_kind(git_dir: &Path, oid: &ObjectSha) -> Result<String> {
     let hex = hex::encode(oid.as_bytes());
-    let loose = git_dir
-        .join("objects")
-        .join(&hex[0..2])
-        .join(&hex[2..]);
+    let loose = git_paths::loose_object_path(git_dir, &hex);
     let f = File::open(&loose).with_context(|| format!("open object {}", loose.display()))?;
     let raw = BufReader::new(f);
     let mut zlib = ZlibDecoder::new(raw);
@@ -466,10 +462,7 @@ impl TreeObject {
     }
 
     pub fn read_loose_tree(repo: &Path, hex_oid: &str) -> TreeObject {
-        let loose = repo
-            .join("objects")
-            .join(&hex_oid[0..2])
-            .join(&hex_oid[2..]);
+        let loose = git_paths::loose_object_path(repo, hex_oid);
         assert!(
             loose.is_file(),
             "loose object missing: {}",
@@ -527,9 +520,10 @@ pub fn write_hash_object(
 ) -> Result<(), anyhow::Error> {
 
     let hash = hex::encode(hash.as_bytes());
-    let object_dir_path = root.as_ref().join("objects").join(&hash[0..2]);
-    fs::create_dir_all(&object_dir_path)?;
-    let object_file_path = object_dir_path.join(&hash[2..]);
+    let object_file_path = git_paths::loose_object_path(root.as_ref(), &hash);
+    if let Some(object_dir_path) = object_file_path.parent() {
+        fs::create_dir_all(object_dir_path)?;
+    }
     let mut object_file = File::create(object_file_path)?;
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(content)?;

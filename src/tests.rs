@@ -13,8 +13,8 @@ use flate2::bufread::ZlibDecoder;
 use crate::object::{
     commit_tree, CommitIdentity, CommitObject, FileMode, ObjectSha, TreeObject,
 };
-use crate::head::Head;
-use crate::reference::{branch_ref_path, read_ref, update_ref};
+use crate::git_paths::branch_ref_path;
+use crate::reference::{read_ref, update_ref};
 use crate::symbolic_ref::{read_symbolic_ref, write_symbolic_ref, SymbolicRef};
 
 /// `run_git` 在 worktree 下创建的标准 git 目录（相对 worktree，与 `.gift` 等区分）
@@ -48,10 +48,7 @@ fn run_git(dir: &Path, args: &[&str]) {
 
 /// zlib 解压后的完整 loose object 字节（含 `type len\0` 头）
 fn decompress_loose_object(git_dir: &Path, hex_oid: &str) -> Vec<u8> {
-    let loose = git_dir
-        .join("objects")
-        .join(&hex_oid[0..2])
-        .join(&hex_oid[2..]);
+    let loose = crate::git_paths::loose_object_path(git_dir, hex_oid);
     let f = fs::File::open(&loose).expect("open loose object");
     let mut zlib = ZlibDecoder::new(std::io::BufReader::new(f));
     let mut raw = Vec::new();
@@ -280,10 +277,7 @@ fn stage_paths_roundtrip_index() {
         );
 
         let hex_oid = hex::encode(e.obj_name().as_bytes());
-        let loose = git_dir
-            .join("objects")
-            .join(&hex_oid[0..2])
-            .join(&hex_oid[2..]);
+        let loose = crate::git_paths::loose_object_path(&git_dir, &hex_oid);
         assert!(
             loose.is_file(),
             "loose object file should exist: {}",
@@ -475,10 +469,7 @@ fn from_index_file_write_tree_matches_git_write_tree() {
         "root tree oid vs git write-tree"
     );
 
-    let loose = git_dir
-        .join("objects")
-        .join(&want_hex[0..2])
-        .join(&want_hex[2..]);
+    let loose = crate::git_paths::loose_object_path(&git_dir, &want_hex);
     assert!(loose.is_file(), "root loose object exists");
 
     let cat_t = git_stdout(&case_dir, &["cat-file", "-t", &want_hex])
@@ -625,10 +616,7 @@ fn commit_tree_writes_loose_object() {
 
     let oid = commit_tree(&git_dir, &commit).expect("commit_tree");
     let hex_out = hex::encode(oid.as_bytes());
-    let loose = git_dir
-        .join("objects")
-        .join(&hex_out[0..2])
-        .join(&hex_out[2..]);
+    let loose = crate::git_paths::loose_object_path(&git_dir, &hex_out);
     assert!(loose.is_file(), "loose commit written");
 
     let round = CommitObject::read_loose_commit(&git_dir, &hex_out);

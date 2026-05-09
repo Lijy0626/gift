@@ -3,46 +3,11 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-
-/// `worktree.join(git_dir)`，即仓库目录的绝对路径
-pub fn resolve_git_dir(worktree: &Path, git_dir: impl AsRef<Path>) -> PathBuf {
-    worktree.join(git_dir.as_ref())
-}
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolicRef {
-    pub ref_name: String,   // `ref:` 后的 Git ref 名（如 `refs/heads/main`或`HEAD`）
-}
-
-/// 将相对git_dir的路径 `ref_name` 转换为相对worktree的路径 `sym_file`
-pub fn ref_name_to_sym_file(git_dir: impl AsRef<Path>, ref_name: impl AsRef<str>) -> PathBuf {
-    git_dir
-        .as_ref()
-        .join(ref_name.as_ref().trim_start_matches('/'))
-}
-
-/// worktree 相对路径、位于 git 目录内的 ref 文件 → Git ref 名（如 `refs/heads/main`）
-pub fn ref_file_to_ref_name(
-    worktree: &Path,
-    git_dir: impl AsRef<Path>,
-    ref_file: impl AsRef<Path>,
-) -> Result<String> {
-    let abs = worktree.join(ref_file.as_ref());
-    let gd = resolve_git_dir(worktree, git_dir.as_ref());
-    let rel = abs.strip_prefix(&gd).with_context(|| {
-        format!(
-            "ref file {} not under git dir {}",
-            ref_file.as_ref().display(),
-            gd.display()
-        )
-    })?;
-    let s = rel.to_string_lossy().replace('\\', "/");
-    let s = s.trim_start_matches('/').to_string();
-    if s.is_empty() {
-        bail!("empty ref name from {}", ref_file.as_ref().display());
-    }
-    Ok(s)
+    pub ref_name: String, // `ref:` 后的 Git ref 名（如 `refs/heads/main`或`HEAD`）
 }
 
 /// 从 `sym_file` 读取 `ref: …`，得到 `ref_name`（`git_dir` 与 `write_symbolic_ref` 对齐，供后续校验扩展）

@@ -4,24 +4,15 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::git_paths::resolve_git_dir;
 use crate::object::{self, ObjectSha};
-use crate::symbolic_ref::resolve_git_dir;
 
 /// 对齐文件在磁盘上的语义：一行 40 位 hex（commit OID）。路径由 `read_ref` / `update_ref` 的参数传入，不放在本结构里。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ref {
     pub commit_id: ObjectSha,
-}
-
-/// worktree 相对路径：`<git_dir>/refs/heads/<branch_name>`
-pub fn branch_ref_path(git_dir: impl AsRef<Path>, branch_name: &str) -> PathBuf {
-    git_dir
-        .as_ref()
-        .join("refs")
-        .join("heads")
-        .join(branch_name)
 }
 
 fn ensure_loose_commit(
