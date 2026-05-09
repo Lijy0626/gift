@@ -1,4 +1,5 @@
-//! 直接 OID 的 ref（`git update-ref` 写入的一行 hex），不包含 `ref:` symbolic 内容。
+//! 直接 OID 的 ref（`git update-ref`）；路径相对 **worktree 根**。
+//! **`git_dir`**：git 目录相对 worktree（`.git` / `.gift` 等），由上层传入。
 
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -6,21 +7,28 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::object::{self, ObjectSha};
+use crate::symbolic_ref::resolve_git_dir;
 
-/// 相对 `git_dir` 的路径 + 指向的 commit（direct ref）
+/// 对齐文件在磁盘上的语义：一行 40 位 hex（commit OID）。路径由 `read_ref` / `update_ref` 的参数传入，不放在本结构里。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ref {
-    pub path: PathBuf,
     pub commit_id: ObjectSha,
 }
 
-/// `refs/heads/<branch_name>`
-pub fn branch_ref_path(branch_name: &str) -> PathBuf {
-    PathBuf::from("refs/heads").join(branch_name)
+/// worktree 相对路径：`<git_dir>/refs/heads/<branch_name>`
+pub fn branch_ref_path(git_dir: impl AsRef<Path>, branch_name: &str) -> PathBuf {
+    git_dir
+        .as_ref()
+        .join("refs")
+        .join("heads")
+        .join(branch_name)
 }
 
-fn ensure_loose_commit(git_dir: &Path, oid: &ObjectSha) -> Result<()> {
-    let kind = object::read_loose_object_kind(git_dir, oid).with_context(|| {
+fn ensure_loose_commit(
+    git_dir_abs: &Path, 
+    oid: &ObjectSha
+) -> Result<()> {
+    let kind = object::read_loose_object_kind(git_dir_abs, oid).with_context(|| {
         format!(
             "object missing or unreadable for {}",
             hex::encode(oid.as_bytes())
@@ -32,10 +40,15 @@ fn ensure_loose_commit(git_dir: &Path, oid: &ObjectSha) -> Result<()> {
     Ok(())
 }
 
-/// 读取 ref 文件：一行 40 位 hex，且 loose 对象存在且为 `commit`
-pub fn read_ref(git_dir: &Path, path: impl AsRef<Path>) -> Result<Ref> {
+/// 读取 ref；`path` 相对 worktree；`git_dir` 用于定位 `objects/` 做类型校验
+pub fn read_ref(
+    worktree: &Path,
+    git_dir: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+) -> Result<Ref> {
     let path = path.as_ref();
-    let full = git_dir.join(path);
+    let full = worktree.join(path);
+    let gd = resolve_git_dir(worktree, git_dir.as_ref());
     let content = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;
     let line = content.trim();
     if line.starts_with("ref:") {
@@ -62,25 +75,23 @@ pub fn read_ref(git_dir: &Path, path: impl AsRef<Path>) -> Result<Ref> {
         .try_into()
         .map_err(|v: Vec<u8>| anyhow::anyhow!("oid length {}", v.len()))?;
     let commit_id = ObjectSha::SHA1(bytes);
-    ensure_loose_commit(git_dir, &commit_id)?;
-    Ok(Ref {
-        path: path.to_path_buf(),
-        commit_id,
-    })
+    ensure_loose_commit(&gd, &commit_id)?;
+    Ok(Ref { commit_id })
 }
 
-/// 写入 ref（`git update-ref <path> <commit>`）：校验目标为 commit 后写入一行 hex + 换行
+/// 写入 ref
 pub fn update_ref(
-    git_dir: &Path,
+    worktree: &Path,
+    git_dir: impl AsRef<Path>,
     path: impl AsRef<Path>,
     commit_id: &ObjectSha,
 ) -> Result<Ref> {
     let ObjectSha::SHA1(_) = commit_id else {
         bail!("update_ref only supports SHA1 oids");
     };
-    ensure_loose_commit(git_dir, commit_id)?;
-    let path = path.as_ref().to_path_buf();
-    let full = git_dir.join(&path);
+    let gd = resolve_git_dir(worktree, git_dir.as_ref());
+    ensure_loose_commit(&gd, commit_id)?;
+    let full = worktree.join(path.as_ref());
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
@@ -89,7 +100,6 @@ pub fn update_ref(
     let hex = hex::encode(commit_id.as_bytes());
     write!(f, "{hex}\n").with_context(|| format!("write {}", full.display()))?;
     Ok(Ref {
-        path,
         commit_id: commit_id.clone(),
     })
 }

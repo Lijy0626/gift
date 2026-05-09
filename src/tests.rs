@@ -13,7 +13,14 @@ use flate2::bufread::ZlibDecoder;
 use crate::object::{
     commit_tree, CommitIdentity, CommitObject, FileMode, ObjectSha, TreeObject,
 };
+use crate::head::Head;
 use crate::reference::{branch_ref_path, read_ref, update_ref};
+use crate::symbolic_ref::{read_symbolic_ref, write_symbolic_ref, SymbolicRef};
+
+/// `run_git` 在 worktree 下创建的标准 git 目录（相对 worktree，与 `.gift` 等区分）
+fn test_git_dir() -> &'static Path {
+    Path::new(".git")
+}
 
 fn make_case_dir(case_name: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -633,8 +640,12 @@ fn commit_tree_writes_loose_object() {
 #[test]
 fn branch_ref_path_joins_heads() {
     assert_eq!(
-        branch_ref_path("main"),
-        PathBuf::from("refs/heads/main")
+        branch_ref_path(test_git_dir(), "main"),
+        PathBuf::from(".git").join("refs").join("heads").join("main")
+    );
+    assert_eq!(
+        branch_ref_path(Path::new(".gift"), "main"),
+        PathBuf::from(".gift").join("refs").join("heads").join("main")
     );
 }
 
@@ -642,7 +653,6 @@ fn branch_ref_path_joins_heads() {
 #[test]
 fn read_ref_and_update_ref_match_git() {
     let case_dir = make_case_dir("git_ref_update");
-    let git_dir = case_dir.join(".git");
 
     fs::write(case_dir.join("f.txt"), "x\n").unwrap();
     run_git(&case_dir, &["init"]);
@@ -654,21 +664,23 @@ fn read_ref_and_update_ref_match_git() {
         .trim()
         .to_string();
     let c0 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "c0");
-    let ref_path = branch_ref_path("mine");
+    let ref_path = branch_ref_path(test_git_dir(), "mine");
 
     run_git(
         &case_dir,
         &["update-ref", &format!("refs/heads/mine"), &c0],
     );
 
-    let r = read_ref(&git_dir, &ref_path).expect("read_ref");
-    assert_eq!(r.path, ref_path);
+    let r = read_ref(&case_dir, test_git_dir(), &ref_path).expect("read_ref");
     assert_eq!(hex::encode(r.commit_id.as_bytes()), c0);
 
     let c1 = git_commit_tree_with_env(&case_dir, &tree_hex, &[&c0], "c1");
-    update_ref(&git_dir, &ref_path, &ObjectSha::SHA1(
-        hex::decode(&c1).unwrap().try_into().unwrap(),
-    ))
+    update_ref(
+        &case_dir,
+        test_git_dir(),
+        &ref_path,
+        &ObjectSha::SHA1(hex::decode(&c1).unwrap().try_into().unwrap()),
+    )
     .expect("update_ref");
 
     let rev = git_stdout(&case_dir, &["rev-parse", "refs/heads/mine"])
@@ -678,7 +690,7 @@ fn read_ref_and_update_ref_match_git() {
         .trim()
         .to_string();
     assert_eq!(rev, c1);
-    let r2 = read_ref(&git_dir, &ref_path).expect("read_ref after gift update_ref");
+    let r2 = read_ref(&case_dir, test_git_dir(), &ref_path).expect("read_ref after gift update_ref");
     assert_eq!(hex::encode(r2.commit_id.as_bytes()), c1);
 }
 
@@ -686,7 +698,6 @@ fn read_ref_and_update_ref_match_git() {
 #[test]
 fn update_ref_rejects_non_commit_object() {
     let case_dir = make_case_dir("ref_reject_tree");
-    let git_dir = case_dir.join(".git");
 
     fs::write(case_dir.join("f.txt"), "y\n").unwrap();
     run_git(&case_dir, &["init"]);
@@ -698,7 +709,13 @@ fn update_ref_rejects_non_commit_object() {
         .trim()
         .to_string();
     let tree_sha = ObjectSha::SHA1(hex::decode(&tree_hex).unwrap().try_into().unwrap());
-    let err = update_ref(&git_dir, branch_ref_path("bad"), &tree_sha).unwrap_err();
+    let err = update_ref(
+        &case_dir,
+        test_git_dir(),
+        branch_ref_path(test_git_dir(), "bad"),
+        &tree_sha,
+    )
+    .unwrap_err();
     assert!(
         err.to_string().contains("commit") || err.to_string().contains("tree"),
         "unexpected err: {err:?}"
@@ -709,18 +726,80 @@ fn update_ref_rejects_non_commit_object() {
 #[test]
 fn read_ref_rejects_symbolic_file() {
     let case_dir = make_case_dir("ref_reject_sym");
-    let git_dir = case_dir.join(".git");
     run_git(&case_dir, &["init"]);
 
-    let p = branch_ref_path("sym");
-    let full = git_dir.join(&p);
+    let p = branch_ref_path(test_git_dir(), "sym");
+    let full = case_dir.join(&p);
     fs::create_dir_all(full.parent().unwrap()).unwrap();
     fs::write(&full, "ref: refs/heads/main\n").unwrap();
 
-    let err = read_ref(&git_dir, &p).unwrap_err();
+    let err = read_ref(&case_dir, test_git_dir(), &p).unwrap_err();
     assert!(
         err.to_string().contains("symbolic") || err.to_string().contains("direct"),
         "unexpected err: {err:?}"
     );
+}
+
+/// `git symbolic-ref` 写入 HEAD 后，`read_symbolic_ref` 得到 worktree 相对路径。
+#[test]
+fn read_symbolic_ref_matches_git() {
+    let case_dir = make_case_dir("sym_read_git");
+    fs::write(case_dir.join("f.txt"), "a\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "f.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let c0 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "root");
+    run_git(
+        &case_dir,
+        &["update-ref", "refs/heads/main", &c0],
+    );
+    run_git(
+        &case_dir,
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+    );
+
+    let head_path = test_git_dir().join("HEAD");
+    let s = read_symbolic_ref(&case_dir, &head_path).expect("read_symbolic_ref");
+    assert_eq!(s.ref_name, "refs/heads/main");
+}
+
+/// `write_symbolic_ref` 后，`git symbolic-ref -q HEAD` 读到目标 ref 名。
+#[test]
+fn write_symbolic_ref_matches_git() {
+    let case_dir = make_case_dir("sym_write_git");
+    fs::write(case_dir.join("g.txt"), "b\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "g.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let c0 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "tip");
+    run_git(
+        &case_dir,
+        &["update-ref", "refs/heads/foo", &c0],
+    );
+
+    let sym = SymbolicRef {
+        ref_name: "refs/heads/foo".into(),
+    };
+    write_symbolic_ref(
+        &case_dir,
+        test_git_dir().join("HEAD"),
+        &sym,
+    )
+    .expect("write_symbolic_ref");
+
+    let got = git_stdout(&case_dir, &["symbolic-ref", "-q", "HEAD"])
+        .trim()
+        .to_string();
+    assert_eq!(got, "refs/heads/foo");
 }
 

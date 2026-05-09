@@ -2,7 +2,9 @@ use std::fs;
 use std::path::Path;
 
 pub mod object;
+pub mod symbolic_ref;
 pub mod reference;
+pub mod head;
 pub mod index;
 pub mod staging;
 

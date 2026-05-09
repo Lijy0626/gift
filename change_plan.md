@@ -30,20 +30,19 @@ commit_message
 1. 新增`struct Ref`  
 ```rust
 pub struct Ref {
-    path: PathBuf,
     commit_id: ObjectSha
 }
 ```  
 
 2. 实现从磁盘中读取出`Ref`的函数
 
-3. 实现新建`Ref`并保存到磁盘(`refs/heads/<ref-name>`)的函数，类比`git update-ref <path> <commit-object-name>`  
+3. 实现新建`Ref`并保存到磁盘的函数  
 
-### 四、实现SymbolicRef, 复现git symbolic-ref <sref-name(通常为HEAD)> <path>
+### 四、实现SymbolicRef, 复现git symbolic-ref <sref-name> <path>
 1. 新增`struct SymbolicRef`
 ```rust
 pub struct SymbolicRef {
-    path: PathBuf  // 指向refs目录下的某个文件
+    path: PathBuf  // 与git_dir的相对路径, 指向refs目录下的某个文件
 }
 ```
 
@@ -56,8 +55,10 @@ pub struct SymbolicRef {
 新增`enum Head`, 对应`.git/HEAD`中的内容
 ```rust
 enum Head {
-    TargetBranch(Ref),
-    TargetCommit(ObjectHash)
+    /// symbolic：HEAD相当于是SymbolicRef, 指向.git/refs/heads/xxx
+    TargetBranch{ branch_ref_path: PathBuf },
+    /// detached：HEAD 文件内直接是 40 hex
+    TargetCommit(ObjectSha)
 }
 ```
 为它实现一系列方法(包括从磁盘中读, 写入磁盘, 读取到目标commit_id)  
@@ -68,8 +69,8 @@ enum Head {
 3. 根据`.git/HEAD`保存的信息，确定父commit
     - `.git/HEAD`指向`.git/refs/heads`里面的引用(非detached HEAD): 则根据引用里包含的那个`commit_id`找到父commit
     - `.git/HEAD`内直接保存了一个`commit_id`(detached HEAD):  则这个`commit_id`对应的就是父commit
-3. 构造`Object::Commit`, 并保存到磁盘上
-4. 更新`.git/HEAD`
+4. 构造`Object::Commit`, 并保存到磁盘上
+5. 更新`.git/HEAD`
     -  非detached HEAD: 将`.git/HEAD`所指向的那个引用文件里保存的commit_id更新成新的commit_id
     - detached HEAD: 将`.git/HEAD`文件里保存的commit_id更新成新的commit_id
 
