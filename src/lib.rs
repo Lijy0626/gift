@@ -7,6 +7,8 @@ pub mod symbolic_ref;
 pub mod reference;
 pub mod head;
 pub mod index;
+pub mod commit;
+pub mod commit_identity;
 pub mod staging;
 
 #[cfg(test)]

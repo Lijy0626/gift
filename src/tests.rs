@@ -10,6 +10,7 @@ use crate::index;
 use crate::index::index_tree::{IndexRootTree, TreeNode};
 use flate2::bufread::ZlibDecoder;
 
+use crate::commit;
 use crate::object::{
     commit_tree, CommitIdentity, CommitObject, FileMode, ObjectSha, TreeObject,
 };
@@ -20,6 +21,16 @@ use crate::symbolic_ref::{read_symbolic_ref, write_symbolic_ref, SymbolicRef};
 /// `run_git` 在 worktree 下创建的标准 git 目录（相对 worktree，与 `.gift` 等区分）
 fn test_git_dir() -> &'static Path {
     Path::new(".git")
+}
+
+/// `commit` 测试用固定身份，避免读写进程环境变量。
+fn test_commit_identity() -> CommitIdentity {
+    CommitIdentity {
+        name: "Gift Test".into(),
+        email: "gift@test.local".into(),
+        unix_time: 1_700_000_000,
+        tz: "+0800".into(),
+    }
 }
 
 fn make_case_dir(case_name: &str) -> PathBuf {
@@ -789,5 +800,110 @@ fn write_symbolic_ref_matches_git() {
         .trim()
         .to_string();
     assert_eq!(got, "refs/heads/foo");
+}
+
+/// 分支 symbolic HEAD：首次提交无 parent；第二次提交单 parent 且为首次 OID，`HEAD` 仍为 symbolic。
+#[test]
+fn commit_on_branch_first_then_second() {
+    let case_dir = make_case_dir("commit_branch_twice");
+    let id = test_commit_identity();
+    let git_bare = case_dir.join(".git");
+
+    fs::write(case_dir.join("track.txt"), "v1\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "track.txt"]);
+
+    let oid1 = commit::commit(
+        &case_dir,
+        test_git_dir(),
+        id.clone(),
+        id.clone(),
+        "first commit".into(),
+    )
+    .expect("first commit");
+
+    let hex1 = hex::encode(oid1.as_bytes());
+    let head_git = git_stdout(&case_dir, &["rev-parse", "HEAD"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_git, hex1, "HEAD after first commit");
+
+    let sym_out = git_stdout(&case_dir, &["symbolic-ref", "-q", "HEAD"]);
+    let sym = sym_out.trim();
+    assert!(sym.starts_with("refs/heads/"), "still symbolic: {sym}");
+
+    let p1 = CommitObject::read_loose_commit(&git_bare, &hex1);
+    assert!(p1.parents.is_empty(), "root has no parent");
+    assert_eq!(p1.message, b"first commit\n");
+
+    fs::write(case_dir.join("track.txt"), "v2\n").unwrap();
+    run_git(&case_dir, &["add", "track.txt"]);
+
+    let oid2 = commit::commit(
+        &case_dir,
+        test_git_dir(),
+        id.clone(),
+        id.clone(),
+        "second".into(),
+    )
+    .expect("second commit");
+
+    let hex2 = hex::encode(oid2.as_bytes());
+    let head2 = git_stdout(&case_dir, &["rev-parse", "HEAD"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head2, hex2);
+
+    let p2 = CommitObject::read_loose_commit(&git_bare, &hex2);
+    assert_eq!(p2.parents.len(), 1, "second commit has one parent");
+    assert_eq!(hex::encode(p2.parents[0].as_bytes()), hex1);
+    assert_eq!(p2.message, b"second\n");
+}
+
+/// detached `HEAD`：`commit` 后 `HEAD` 为裸 OID，新 commit 的 parent 为 detached 指向的旧 OID。
+#[test]
+fn commit_on_detached_head_updates_oid_and_parent() {
+    let case_dir = make_case_dir("commit_detached");
+    let id = test_commit_identity();
+    let git_bare = case_dir.join(".git");
+
+    fs::write(case_dir.join("only.txt"), "a\n").unwrap();
+    run_git(&case_dir, &["init"]);
+    run_git(&case_dir, &["add", "only.txt"]);
+    let tree_hex = git_stdout(&case_dir, &["write-tree"])
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let c0 = git_commit_tree_with_env(&case_dir, &tree_hex, &[], "seed");
+    fs::write(case_dir.join(".git/HEAD"), format!("{c0}\n")).unwrap();
+
+    fs::write(case_dir.join("only.txt"), "b\n").unwrap();
+    run_git(&case_dir, &["add", "only.txt"]);
+
+    let oid_new = commit::commit(
+        &case_dir,
+        test_git_dir(),
+        id.clone(),
+        id.clone(),
+        "while detached".into(),
+    )
+    .expect("commit detached");
+
+    let hex_new = hex::encode(oid_new.as_bytes());
+    let raw_head = fs::read_to_string(case_dir.join(".git/HEAD")).unwrap();
+    assert_eq!(raw_head.trim(), hex_new, "HEAD must be raw oid");
+
+    let parsed = CommitObject::read_loose_commit(&git_bare, &hex_new);
+    assert_eq!(parsed.parents.len(), 1);
+    assert_eq!(hex::encode(parsed.parents[0].as_bytes()), c0);
+    assert_eq!(parsed.message, b"while detached\n");
 }
 
