@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::git_paths::resolve_git_dir;
-use crate::object::{self, ObjectSha};
+use crate::object::{Object, ObjectSha};
 
 /// 对齐文件在磁盘上的语义：一行 40 位 hex（commit OID）。路径由 `read_ref` / `update_ref` 的参数传入，不放在本结构里。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +19,7 @@ fn ensure_loose_commit(
     git_dir_abs: &Path, 
     oid: &ObjectSha
 ) -> Result<()> {
-    let kind = object::read_loose_object_kind(git_dir_abs, oid).with_context(|| {
+    let kind = Object::read_loose_object_kind(git_dir_abs, oid).with_context(|| {
         format!(
             "object missing or unreadable for {}",
             hex::encode(oid.as_bytes())

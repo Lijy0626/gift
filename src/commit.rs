@@ -17,7 +17,7 @@ use crate::git_paths::resolve_git_dir;
 use crate::head::Head;
 use crate::index::index_tree::IndexRootTree;
 use crate::index::parse_index_file;
-use crate::object::{commit_tree, read_loose_object_kind, CommitIdentity, CommitObject, ObjectSha};
+use crate::object::{commit_tree, Object, CommitIdentity, CommitObject, ObjectSha};
 
 /// 使用当前 index 创建一次提交：写 tree、写 commit、按 `HEAD` 形态更新引用。
 ///
@@ -70,8 +70,9 @@ pub fn commit(
     Ok(new_oid)
 }
 
+// resolve_parents的辅助函数, 确保oid对应的对象在objects/文件夹中, 并且是commit对象
 fn ensure_commit_object(git_abs: &Path, oid: &ObjectSha, ctx: &str) -> Result<()> {
-    let kind = read_loose_object_kind(git_abs, oid)
+    let kind = Object::read_loose_object_kind(git_abs, oid)
         .with_context(|| format!("{ctx}: read object type {}", hex::encode(oid.as_bytes())))?;
     if kind != "commit" {
         bail!("{ctx}: expected loose commit, got {kind:?}");
@@ -79,7 +80,10 @@ fn ensure_commit_object(git_abs: &Path, oid: &ObjectSha, ctx: &str) -> Result<()
     Ok(())
 }
 
-/// 按 `HEAD` 与 tip ref 文件是否存在，得到 `parents`（至多一个元素）。
+/// 得到Commit对象的 `parents`
+/// 目前不考虑merge， 故parent只会有一个
+/// 情况1: detached head(即HEAD文件中是一个oid), 那么parent的oid就是head里面包含的oid
+/// 情况2: 非detached head(即HEAD文件中是一个branch ref的路径), 那么parent的oid要从branch ref中取得
 fn resolve_parents(worktree: &Path, git_abs: &Path, head: &Head) -> Result<Vec<ObjectSha>> {
     match head {
         Head::TargetCommit(oid) => {

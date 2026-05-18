@@ -47,6 +47,46 @@ pub enum Object {
     Tag, // TODO
 }
 
+impl Object {
+    /// 从 zlib 解压流上读取 object 类型名（`blob` / `tree` / …），类似 `git cat-file -t`
+    fn read_object_type<R: BufRead>(
+        reader: &mut BufReader<&mut ZlibDecoder<R>>,
+    ) -> anyhow::Result<String> {
+        let mut buf = Vec::new();
+        reader.read_until(b' ', &mut buf)?;
+        buf.pop(); // 去掉分隔空格
+        Ok(String::from_utf8(buf)?)
+    }
+
+    /// 跳过 `git cat-file` 头部里类型之后的 `<ascii-size>\0`（与 `read_object_type` 连用）。
+    fn skip_git_object_size_nul<R: BufRead>(reader: &mut R) -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        reader.read_until(b'\0', &mut buf)?;
+        Ok(())
+    }
+
+    /// 读取 `.git/objects` 下 loose 对象的类型名（`commit` / `tree` / `blob` / …）
+    pub fn read_loose_object_kind(git_dir: &Path, oid: &ObjectSha) -> Result<String> {
+        let hex = hex::encode(oid.as_bytes());
+        let loose = git_paths::loose_object_path(git_dir, &hex);
+        let f = File::open(&loose).with_context(|| format!("open object {}", loose.display()))?;
+        let raw = BufReader::new(f);
+        let mut zlib = ZlibDecoder::new(raw);
+        let mut br = BufReader::new(&mut zlib);
+        Object::read_object_type(&mut br)
+    }
+}
+
+pub struct BlobObject {
+    object_name: ObjectSha,
+}
+
+impl BlobObject {
+    pub fn object_name(&self) -> &ObjectSha {
+        &self.object_name
+    }
+}
+
 /// author / committer 行中的「姓名 + 邮箱 + 时间 + 时区」
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitIdentity {
@@ -115,7 +155,7 @@ impl CommitObject {
                 bail!("commit header line missing newline");
             }
             let line = std::str::from_utf8(&line_buf[..line_buf.len() - 1])?;
-            headers.push(parse_header_line(line, is_sha1)?);
+            headers.push(ParsedHeader::parse_header_line(line, is_sha1)?);
         }
 
         let mut message = Vec::new();
@@ -206,10 +246,10 @@ impl CommitObject {
         let mut zlib = ZlibDecoder::new(raw);
         let mut br = BufReader::new(&mut zlib);
 
-        let kind = read_object_type(&mut br).expect("read type");
+        let kind = Object::read_object_type(&mut br).expect("read type");
         assert_eq!(kind, "commit", "cat-file -t should be commit");
 
-        skip_git_object_size_nul(&mut br).expect("skip size\\0");
+        Object::skip_git_object_size_nul(&mut br).expect("skip size\\0");
 
         let object_name = if is_sha1 {
             let oid_bytes: [u8; 20] = hex::decode(hex_oid)
@@ -238,6 +278,7 @@ pub fn commit_tree(git_dir: impl AsRef<Path>, commit: &CommitObject) -> Result<O
     Ok(oid)
 }
 
+// 辅助 read_commit, 从磁盘上读取 commit 的结构
 enum ParsedHeader {
     Tree(ObjectSha),
     Parent(ObjectSha),
@@ -245,111 +286,75 @@ enum ParsedHeader {
     Committer(CommitIdentity),
     Other(String),
 }
+impl ParsedHeader {
+    fn parse_header_line(line: &str, is_sha1: bool) -> Result<ParsedHeader> {
+        if let Some(hex) = line.strip_prefix("tree ") {
+            return Ok(ParsedHeader::Tree(Self::parse_oid_hex(hex.trim(), is_sha1)?));
+        }
+        if let Some(hex) = line.strip_prefix("parent ") {
+            return Ok(ParsedHeader::Parent(Self::parse_oid_hex(hex.trim(), is_sha1)?));
+        }
+        if let Some(rest) = line.strip_prefix("author ") {
+            return Ok(ParsedHeader::Author(Self::parse_identity(rest)?));
+        }
+        if let Some(rest) = line.strip_prefix("committer ") {
+            return Ok(ParsedHeader::Committer(Self::parse_identity(rest)?));
+        }
+        Ok(ParsedHeader::Other(line.to_string()))
+    }
 
-fn parse_header_line(line: &str, is_sha1: bool) -> Result<ParsedHeader> {
-    if let Some(hex) = line.strip_prefix("tree ") {
-        return Ok(ParsedHeader::Tree(parse_oid_hex(hex.trim(), is_sha1)?));
+    fn parse_oid_hex(word: &str, is_sha1: bool) -> Result<ObjectSha> {
+        let expected = if is_sha1 { 40 } else { 64 };
+        if word.len() != expected {
+            bail!("bad object id hex length: got {}, want {}", word.len(), expected);
+        }
+        let v = hex::decode(word)?;
+        if is_sha1 {
+            let bytes: [u8; 20] = v
+                .try_into()
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("tree/parent oid: want 20 bytes, got {}", v.len()))?;
+            Ok(ObjectSha::SHA1(bytes))
+        } else {
+            let bytes: [u8; 32] = v
+                .try_into()
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("tree/parent oid: want 32 bytes, got {}", v.len()))?;
+            Ok(ObjectSha::SHA256(bytes))
+        }
     }
-    if let Some(hex) = line.strip_prefix("parent ") {
-        return Ok(ParsedHeader::Parent(parse_oid_hex(hex.trim(), is_sha1)?));
+
+    fn parse_identity(s: &str) -> Result<CommitIdentity> {
+        let idx = s.rfind('>').context("identity line: missing '>'")?;
+        let name_email = s[..idx].trim_end();
+        let tail = s[idx + 1..].trim();
+        let mut it = tail.split_whitespace();
+        let unix: i64 = it.next().context("identity: missing unix time")?.parse()?;
+        let tz = it
+            .next()
+            .context("identity: missing timezone")?
+            .to_string();
+        if it.next().is_some() {
+            bail!("identity: unexpected trailing fields");
+        }
+
+        let lt = name_email.rfind('<').context("identity: missing '<'")?;
+        let name = name_email[..lt].trim().to_string();
+        let email = name_email[lt + 1..].trim().to_string();
+        Ok(CommitIdentity {
+            name,
+            email,
+            unix_time: unix,
+            tz,
+        })
     }
-    if let Some(rest) = line.strip_prefix("author ") {
-        return Ok(ParsedHeader::Author(parse_identity(rest)?));
-    }
-    if let Some(rest) = line.strip_prefix("committer ") {
-        return Ok(ParsedHeader::Committer(parse_identity(rest)?));
-    }
-    Ok(ParsedHeader::Other(line.to_string()))
+
 }
 
-fn parse_oid_hex(word: &str, is_sha1: bool) -> Result<ObjectSha> {
-    let expected = if is_sha1 { 40 } else { 64 };
-    if word.len() != expected {
-        bail!("bad object id hex length: got {}, want {}", word.len(), expected);
-    }
-    let v = hex::decode(word)?;
-    if is_sha1 {
-        let bytes: [u8; 20] = v
-            .try_into()
-            .map_err(|v: Vec<u8>| anyhow::anyhow!("tree/parent oid: want 20 bytes, got {}", v.len()))?;
-        Ok(ObjectSha::SHA1(bytes))
-    } else {
-        let bytes: [u8; 32] = v
-            .try_into()
-            .map_err(|v: Vec<u8>| anyhow::anyhow!("tree/parent oid: want 32 bytes, got {}", v.len()))?;
-        Ok(ObjectSha::SHA256(bytes))
-    }
-}
-
-fn parse_identity(s: &str) -> Result<CommitIdentity> {
-    let idx = s.rfind('>').context("identity line: missing '>'")?;
-    let name_email = s[..idx].trim_end();
-    let tail = s[idx + 1..].trim();
-    let mut it = tail.split_whitespace();
-    let unix: i64 = it.next().context("identity: missing unix time")?.parse()?;
-    let tz = it
-        .next()
-        .context("identity: missing timezone")?
-        .to_string();
-    if it.next().is_some() {
-        bail!("identity: unexpected trailing fields");
-    }
-
-    let lt = name_email.rfind('<').context("identity: missing '<'")?;
-    let name = name_email[..lt].trim().to_string();
-    let email = name_email[lt + 1..].trim().to_string();
-    Ok(CommitIdentity {
-        name,
-        email,
-        unix_time: unix,
-        tz,
-    })
-}
-
+// 辅助CommitObject::to_binary
 fn format_identity_line(prefix: &str, id: &CommitIdentity) -> String {
     format!(
         "{} {} <{}> {} {}\n",
         prefix, id.name, id.email, id.unix_time, id.tz
     )
-}
-
-/// 从 zlib 解压流上读取 object 类型名（`blob` / `tree` / …），类似 `git cat-file -t`
-/// 必须与同一 `BufReader<&mut ZlibDecoder<_>>` 上后续的 `read_tree`、`read_commit` 等解析共用，勿另包一层 `BufReader`。
-fn read_object_type<R: BufRead>(
-    reader: &mut BufReader<&mut ZlibDecoder<R>>,
-) -> anyhow::Result<String> {
-    let mut buf = Vec::new();
-    reader.read_until(b' ', &mut buf)?;
-    buf.pop(); // 去掉分隔空格
-    Ok(String::from_utf8(buf)?)
-}
-
-/// 跳过 `git cat-file` 头部里类型之后的 `<ascii-size>\0`（与 `read_object_type` 连用）。
-pub fn skip_git_object_size_nul<R: BufRead>(reader: &mut R) -> anyhow::Result<()> {
-    let mut buf = Vec::new();
-    reader.read_until(b'\0', &mut buf)?;
-    Ok(())
-}
-
-/// 读取 `.git/objects` 下 loose 对象的类型名（`commit` / `tree` / `blob` / …）
-pub fn read_loose_object_kind(git_dir: &Path, oid: &ObjectSha) -> Result<String> {
-    let hex = hex::encode(oid.as_bytes());
-    let loose = git_paths::loose_object_path(git_dir, &hex);
-    let f = File::open(&loose).with_context(|| format!("open object {}", loose.display()))?;
-    let raw = BufReader::new(f);
-    let mut zlib = ZlibDecoder::new(raw);
-    let mut br = BufReader::new(&mut zlib);
-    read_object_type(&mut br)
-}
-
-pub struct BlobObject {
-    object_name: ObjectSha,
-}
-
-impl BlobObject {
-    pub fn object_name(&self) -> &ObjectSha {
-        &self.object_name
-    }
 }
 
 pub struct TreeEntry {
@@ -474,10 +479,10 @@ impl TreeObject {
         let mut zlib = ZlibDecoder::new(raw);
         let mut br = BufReader::new(&mut zlib);
 
-        let kind = read_object_type(&mut br).expect("read type");
+        let kind = Object::read_object_type(&mut br).expect("read type");
         assert_eq!(kind, "tree", "cat-file -t should be tree");
 
-        skip_git_object_size_nul(&mut br).expect("skip size\\0");
+        Object::skip_git_object_size_nul(&mut br).expect("skip size\\0");
 
         let oid_bytes: [u8; 20] = hex::decode(hex_oid)
             .expect("hex oid")
