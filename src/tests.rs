@@ -33,7 +33,7 @@ fn test_commit_identity() -> CommitIdentity {
     }
 }
 
-fn make_case_dir(case_name: &str) -> PathBuf {
+pub fn make_case_dir(case_name: &str) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -907,3 +907,41 @@ fn commit_on_detached_head_updates_oid_and_parent() {
     assert_eq!(parsed.message, b"while detached\n");
 }
 
+// #[test]
+// fn discover_repo_from_cwd_finds_nearest_gift() {
+//     use std::sync::{Mutex, OnceLock};
+
+//     // 串行化会修改 cwd 的测试
+//     fn cwd_lock() -> &'static Mutex<()> {
+//         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+//         LOCK.get_or_init(|| Mutex::new(()))
+//     }
+
+//     struct RestoreCwd(std::path::PathBuf);
+//     impl Drop for RestoreCwd {
+//         fn drop(&mut self) {
+//             let _ = std::env::set_current_dir(&self.0);
+//         }
+//     }
+
+//     let _guard = cwd_lock().lock().unwrap();
+
+//     let old_cwd = std::env::current_dir().unwrap();
+//     let _restore = RestoreCwd(old_cwd);
+
+//     let case_dir = make_case_dir("discover_repo_from_cwd");
+//     let proj = case_dir.join("proj");
+//     let src = proj.join("src");
+//     fs::create_dir_all(&src).unwrap();
+
+//     // 初始化 .gift
+//     crate::init(proj.join(".gift")).unwrap();
+
+//     // 模拟用户在子目录执行命令
+//     std::env::set_current_dir(&src).unwrap();
+
+//     let repo = crate::git_paths::discover_repo_from_cwd().unwrap();
+
+//     assert_eq!(repo.work_tree, fs::canonicalize(&proj).unwrap());
+//     assert_eq!(repo.git_dir, fs::canonicalize(proj.join(".gift")).unwrap());
+// }
